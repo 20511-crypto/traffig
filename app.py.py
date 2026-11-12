@@ -1,8 +1,12 @@
 import os
 import pickle
+import warnings
 import numpy as np
 import streamlit as st
-from Orange.data import Domain, Table
+from sklearn.exceptions import InconsistentVersionWarning
+from sklearn.neural_network import MLPRegressor
+
+warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
 
 # ---------------------------------------------------------
 # 1. 페이지 기본 설정
@@ -14,37 +18,90 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------
-# 2. Orange3 모델 로드 (캐싱 적용으로 빠른 실시간 추론)
+# 2. Orange3 없이 .pkcls 파일에서 모델 및 전처리 파이프라인 직접 로드
 # ---------------------------------------------------------
 MODEL_PATH = "traffic_casualty_model.pkcls"
 
 
+class _OrangeDummy:
+    def __init__(self, *args, **kwargs):
+        self._init_args = args
+
+
+def _make_variable(cls, *args, **kwargs):
+    return cls(*args, **kwargs)
+
+
+class _OrangePkclsUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if module == "Orange.regression.neural_network" and name == "MLPRegressorWCallback":
+            return MLPRegressor
+        if module == "Orange.data.variable" and name == "make_variable":
+            return _make_variable
+        if module.startswith("Orange."):
+            return _OrangeDummy
+        return super().find_class(module, name)
+
+
 @st.cache_resource
-def load_orange_model(path: str):
+def load_orange_pkcls(path: str):
     if not os.path.exists(path):
         raise FileNotFoundError(f"모델 파일을 찾을 수 없습니다: {path}")
+
     with open(path, "rb") as f:
-        model = pickle.load(f)
-    return model
+        orange_obj = _OrangePkclsUnpickler(f).load()
+
+    skl_model = orange_obj.skl_model
+
+    # 시도 범주 매핑 추출 (예: {'경기': 0, '부산': 1, '서울': 2})
+    sido_map = {"경기": 0, "부산": 1, "서울": 2}
+    for attr in orange_obj.original_domain.attributes:
+        if getattr(attr, "_name", "") == "시도" and hasattr(attr, "_value_index"):
+            sido_map = dict(attr._value_index)
+            break
+
+    sido_options = [k for k, _ in sorted(sido_map.items(), key=lambda x: x[1])]
+
+    # Orange3 전처리 파이프라인(결측치 대치 -> 원-핫 인코딩 -> 표준 정규화) 추출
+    steps = []
+    for attr in orange_obj.domain.attributes:
+        norm = attr._compute_value
+        offset = float(np.asarray(norm.offset).item())
+        factor = float(np.asarray(norm.factor).item())
+        imp = norm.variable
+        default_val = float(np.asarray(imp.value).item())
+        inner = imp.variable
+
+        if hasattr(inner, "value") and not hasattr(inner, "_name"):
+            steps.append(
+                {
+                    "type": "indicator",
+                    "cat_idx": int(inner.value),
+                    "offset": offset,
+                    "factor": factor,
+                }
+            )
+        else:
+            steps.append(
+                {
+                    "type": "continuous",
+                    "name": inner._name,
+                    "default": default_val,
+                    "offset": offset,
+                    "factor": factor,
+                }
+            )
+
+    return skl_model, steps, sido_map, sido_options
 
 
 try:
-    model = load_orange_model(MODEL_PATH)
+    skl_model, pipeline_steps, sido_map, sido_options = load_orange_pkcls(MODEL_PATH)
 except Exception as e:
     st.error(f"❌ 모델 로드 중 오류가 발생했습니다: {e}")
     st.info("GitHub 저장소 루트 경로에 `traffic_casualty_model.pkcls` 파일이 있는지 확인해주세요.")
     st.stop()
 
-# 모델의 원본 입력 도메인에서 시도(DiscreteVariable) 목록 자동 추출
-orig_domain = model.original_domain
-feature_attrs = list(orig_domain.attributes)
-feature_domain = Domain(feature_attrs)
-
-sido_options = ["경기", "부산", "서울"]
-for attr in feature_attrs:
-    if attr.name == "시도" and hasattr(attr, "values"):
-        sido_options = list(attr.values)
-        break
 
 # ---------------------------------------------------------
 # 3. 실시간 예측 함수
@@ -56,25 +113,26 @@ def predict_fatalities(
     minor_injuries: float,
     reported_injuries: float,
 ) -> float:
-    row_values = []
-    for attr in feature_attrs:
-        if attr.name == "사고건수":
-            row_values.append(float(accidents))
-        elif attr.name == "중상자수":
-            row_values.append(float(serious_injuries))
-        elif attr.name == "경상자수":
-            row_values.append(float(minor_injuries))
-        elif attr.name == "부상신고자수":
-            row_values.append(float(reported_injuries))
-        elif attr.name == "시도":
-            row_values.append(attr.to_val(sido))
-        else:
-            row_values.append(np.nan)
+    raw_inputs = {
+        "사고건수": float(accidents),
+        "중상자수": float(serious_injuries),
+        "경상자수": float(minor_injuries),
+        "부상신고자수": float(reported_injuries),
+    }
+    sido_idx = sido_map.get(sido, 0)
 
-    input_table = Table.from_list(feature_domain, [row_values])
-    pred = model(input_table)
-    # 회귀 모델 음수 예측 방지를 위해 0 이상으로 보정
-    return max(0.0, float(pred[0]))
+    features = []
+    for step in pipeline_steps:
+        if step["type"] == "indicator":
+            raw_val = 1.0 if sido_idx == step["cat_idx"] else 0.0
+        else:
+            raw_val = raw_inputs.get(step["name"], step["default"])
+        norm_val = (raw_val - step["offset"]) * step["factor"]
+        features.append(norm_val)
+
+    X = np.array([features], dtype=np.float64)
+    pred = float(skl_model.predict(X)[0])
+    return max(0.0, pred)
 
 
 # ---------------------------------------------------------
@@ -111,7 +169,6 @@ with col_input:
         step=10,
     )
 
-    # 모델 학습에 포함된 나머지 2개 피처(중상자수, 부상신고자수) 처리
     with st.expander("⚙️ 상세 부상 지표 설정 (모델 입력 호환용)", expanded=False):
         auto_ratio = st.checkbox(
             "사고건수 비례 자동 추정 사용 (권장)",
@@ -149,7 +206,7 @@ if predicted_deaths < 5.0:
     school_rules = [
         ("시속 30km 이하 서행 준수", "어린이 보호구역 내 제한속도를 준수하고 전방 시야를 확보하세요."),
         ("횡단보도 일시정지 생활화", "보행자가 없더라도 스쿨존 내 무신호 횡단보도 앞에서는 반드시 일시정지합니다."),
-        (" 불법 주·정차 절대 금지", "주정차 차량은 어린이의 돌발 횡단 시 운전자의 시야를 가리는 주원인입니다."),
+        ("불법 주·정차 절대 금지", "주정차 차량은 어린이의 돌발 횡단 시 운전자의 시야를 가리는 주원인입니다."),
     ]
 elif predicted_deaths < 15.0:
     status_key = "CAUTION"
@@ -183,7 +240,6 @@ green_active = "opacity: 1; box-shadow: 0 0 32px #22c55e;" if status_key == "SAF
 with col_result:
     st.subheader("2️⃣ 실시간 예측 결과 및 위험도 신호등")
 
-    # 예측 수치 메트릭 + 대형 신호등 HTML 렌더링
     traffic_light_html = f"""
     <div style="
         background-color: {bg_tint};
@@ -221,7 +277,6 @@ with col_result:
             </p>
         </div>
 
-        <!-- 대형 3구 신호등 -->
         <div style="
             background-color: #1e293b;
             padding: 16px 20px;
@@ -240,7 +295,6 @@ with col_result:
     """
     st.markdown(traffic_light_html, unsafe_allow_html=True)
 
-    # 어린이 보호구역 안전 수칙 카드
     rules_items_html = "".join(
         [
             f"""
